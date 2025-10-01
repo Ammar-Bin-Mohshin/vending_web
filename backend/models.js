@@ -11,6 +11,46 @@ const db = new sqlite3.Database(path.join(__dirname, "db.sqlite"), (err) => {
   }
 });
 
+function createUsersTable(callback) {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS users (
+      userid TEXT PRIMARY KEY,
+      name TEXT NOT NULL
+    )`,
+    (err) => {
+      if (err) {
+        console.error("Error creating users table:", err.message);
+        callback(err);
+      } else {
+        console.log("Users table created or already exists");
+        callback(null);
+      }
+    }
+  );
+}
+
+function createOrdersTable(callback) {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS orders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userid TEXT NOT NULL,
+      username TEXT NOT NULL,
+      products TEXT NOT NULL,
+      total REAL NOT NULL,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    (err) => {
+      if (err) {
+        console.error("Error creating orders table:", err.message);
+        callback(err);
+      } else {
+        console.log("Orders table created or already exists");
+        callback(null);
+      }
+    }
+  );
+}
+
 try {
   db.serialize(() => {
     db.run(
@@ -101,6 +141,13 @@ try {
         }
       }
     );
+
+    createUsersTable((err) => {
+      if (err) process.exit(1);
+    });
+    createOrdersTable((err) => {
+      if (err) process.exit(1);
+    });
   });
 } catch (err) {
   console.error("Database initialization error:", err.message);
@@ -165,8 +212,10 @@ function placeOrder(orderProducts, callback) {
 
     try {
       orderProducts.forEach((p) => {
-        stmtUpdate.run(p.quantity, p.id, p.quantity);
-        stmtSale.run(p.id, p.quantity, new Date().toISOString());
+        if (!p.failed) {
+          stmtUpdate.run(p.quantity, p.id, p.quantity);
+          stmtSale.run(p.id, p.quantity, new Date().toISOString());
+        }
       });
       stmtUpdate.finalize();
       stmtSale.finalize();
@@ -209,6 +258,61 @@ function updateAdminPasswordAndUsername(id, newUsername, newPasswordHash, callba
   });
 }
 
+function addUser(userid, name, callback) {
+  db.run("INSERT INTO users (userid, name) VALUES (?, ?)", [userid, name], (err) => {
+    if (err) {
+      console.error("Error adding user:", err.message);
+      return callback(err);
+    }
+    callback(null);
+  });
+}
+
+function getAllUsers(callback) {
+  db.all("SELECT * FROM users", [], (err, rows) => {
+    if (err) {
+      console.error("Error fetching users:", err.message);
+      return callback(err);
+    }
+    callback(null, rows);
+  });
+}
+
+function getUserByUserid(userid, callback) {
+  db.get("SELECT * FROM users WHERE userid = ?", [userid], (err, row) => {
+    if (err) {
+      console.error("Error fetching user by userid:", err.message);
+      return callback(err);
+    }
+    callback(null, row);
+  });
+}
+
+function saveOrderSummary(userid, username, products, total, callback) {
+  db.run(
+    "INSERT INTO orders (userid, username, products, total) VALUES (?, ?, ?, ?)",
+    [userid, username, JSON.stringify(products), total],
+    (err) => {
+      if (err) {
+        console.error("Error saving order summary:", err.message);
+        return callback(err);
+      }
+      console.log("✅ Saved order summary for user:", userid);
+      callback(null);
+    }
+  );
+}
+
+function deleteUser(userid, callback) {
+  db.run("DELETE FROM users WHERE userid = ?", [userid], function (err) {
+    if (err) {
+      console.error(`Error deleting user ${userid}:`, err.message);
+      return callback(err);
+    }
+    callback(null, this.changes);
+  });
+}
+
 module.exports = {
   getAllProducts,
   updateProduct,
@@ -216,4 +320,11 @@ module.exports = {
   getAdminByUsername,
   getAdminById,
   updateAdminPasswordAndUsername,
+  addUser,
+  getAllUsers,
+  getUserByUserid,
+  saveOrderSummary,
+  createUsersTable,
+  createOrdersTable,
+  deleteUser,
 };

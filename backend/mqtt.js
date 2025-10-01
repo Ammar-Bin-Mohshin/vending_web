@@ -1,42 +1,36 @@
 const mqtt = require("mqtt");
-const client = mqtt.connect("mqtt://localhost:1883");
 
-let shelfStatus = { 1: false, 2: false, 3: false, 4: false, 5: false }; // Tracks heartbeat status
-let lastHeartbeat = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }; // Timestamp of last heartbeat
-let currentShelf = null;
-let currentItems = [];
-let orderQueue = [];
-let processing = false;
-let currentResolve = null;
-let currentReject = null;
-let timeoutId = null;
-let wsClients = [];
+let shelfStatus = { 1: false, 2: false, 3: false, 4: false, 5: false };
+let lastHeartbeat = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+let cardData = null;
 
-function setWsClients(clients) {
-  wsClients = clients;
-}
+const client = mqtt.connect("mqtt://localhost:1883", {
+  reconnectPeriod: 1000,
+  clientId: `vending_${Math.random().toString(16).slice(3)}`,
+  connectTimeout: 5000,
+});
 
-// Check heartbeats every 5 seconds
 setInterval(() => {
   const now = Date.now();
   for (let shelf = 1; shelf <= 5; shelf++) {
     if (now - lastHeartbeat[shelf] > 30000) {
-      shelfStatus[shelf] = false;
+      if (shelfStatus[shelf]) {
+        shelfStatus[shelf] = false;
+        console.log(`❌ Shelf ${shelf} marked as Disconnected (no heartbeat)`);
+      }
     }
   }
 }, 5000);
 
 client.on("connect", () => {
   console.log("✅ MQTT connected to broker");
-
-  client.subscribe("vending/heartbit/+", (err) => {
+  client.subscribe("vending/heartbit/+", { qos: 1 }, (err) => {
     if (err) console.error("❌ Failed to subscribe to heartbit topics:", err.message);
     else console.log("📡 Subscribed to vending/heartbit/+");
   });
-
-  client.subscribe("vending/response/+", (err) => {
-    if (err) console.error("❌ Failed to subscribe to response topics:", err.message);
-    else console.log("📡 Subscribed to vending/response/+");
+  client.subscribe("card/data", { qos: 1 }, (err) => {
+    if (err) console.error("❌ Failed to subscribe to card/data:", err.message);
+    else console.log("📡 Subscribed to card/data");
   });
 });
 
@@ -45,12 +39,17 @@ client.on("error", (err) => {
 });
 
 client.on("close", () => {
-  console.log("❌ MQTT connection closed");
-  for (let shelf = 1; shelf <= 5; shelf++) shelfStatus[shelf] = false;
+  console.log("❌ MQTT connection closed, attempting to reconnect...");
+  for (let shelf = 1; shelf <= 5; shelf++) {
+    shelfStatus[shelf] = false;
+    console.log(`❌ Shelf ${shelf} marked as Disconnected (connection closed)`);
+  }
+  cardData = null;
 });
 
 client.on("message", (topic, message) => {
   try {
+    console.log(`📥 Received MQTT message on ${topic}: ${message.toString()}`);
     if (topic.startsWith("vending/heartbit/")) {
       const shelf = parseInt(topic.split("/").pop());
       if (shelf >= 1 && shelf <= 5) {
@@ -58,32 +57,27 @@ client.on("message", (topic, message) => {
         lastHeartbeat[shelf] = Date.now();
         console.log(`❤️ Heartbeat from shelf ${shelf}`);
       }
-      return;
-    }
-
-    if (topic.startsWith("vending/response/") && currentItems.length > 0) {
-      const shelf = parseInt(topic.split("/").pop());
-      const response = message.toString();
-
-      if (shelf === currentShelf) {
-        console.log(`📥 Response from shelf ${shelf}: ${response}`);
-        clearTimeout(timeoutId);
-
-        const [id] = currentItems[0].split(",");
-        wsClients.forEach((client) =>
-          client.send(
-            JSON.stringify({
-              type: "orderStatus",
-              id: parseInt(id),
-              status: response === "success" ? "Dispensed" : "Failed",
-            })
-          )
-        );
-
-        currentItems.shift();
-        processNextItem();
+    } else if (topic === "card/data") {
+      const data = JSON.parse(message.toString());
+      if (
+        typeof data.userid === "string" &&
+        data.userid &&
+        typeof data.username === "string" &&
+        data.username &&
+        typeof data.credit === "number" &&
+        data.credit > 0
+      ) {
+        cardData = { userid: data.userid, username: data.username, credit: data.credit };
+        console.log("📋 Stored cardData:", JSON.stringify(cardData));
+        setTimeout(() => {
+          if (cardData && cardData.userid === data.userid) {
+            cardData = null;
+            console.log("🕒 Cleared cardData due to timeout");
+          }
+        }, 30000);
       } else {
-        console.log(`⚠️ Ignoring response from shelf ${shelf}: ${response} (mismatched shelf)`);
+        console.warn("⚠️ Invalid card/data:", message.toString());
+        cardData = null;
       }
     }
   } catch (err) {
@@ -91,124 +85,91 @@ client.on("message", (topic, message) => {
   }
 });
 
-function sendOrderMQTT(products) {
-  return new Promise((resolve, reject) => {
-    const shelves = { 1: [], 2: [], 3: [], 4: [], 5: [] };
+function sendOrderMQTT(products, callback) {
+  console.log("📦 Received order products:", products);
+  if (!client.connected) {
+    console.error("❌ MQTT client not connected");
+    return callback(new Error("MQTT client not connected"), { successfulProducts: [], failedProducts: products.map((p) => ({ ...p, failed: true })) });
+  }
 
-    products.forEach((p) => {
-      const id = p.id;
-      const quantity = p.quantity;
-      if (id >= 1 && id <= 4) shelves[1].push(`${id},${quantity}`);
-      else if (id >= 5 && id <= 8) shelves[2].push(`${id},${quantity}`);
-      else if (id >= 9 && id <= 16) shelves[3].push(`${id},${quantity}`);
-      else if (id >= 17 && id <= 24) shelves[4].push(`${id},${quantity}`);
-      else if (id >= 25 && id <= 32) shelves[5].push(`${id},${quantity}`);
-    });
+  const shelves = { 1: [], 2: [], 3: [], 4: [], 5: [] };
+  const failedProducts = [];
 
-    orderQueue = [];
-    let hasItems = false;
-    for (let s = 5; s >= 1; s--) {
-      if (shelves[s].length > 0) {
-        orderQueue.push({ shelf: s, items: shelves[s] });
-        hasItems = true;
-      }
+  products.forEach((p) => {
+    const id = p.id;
+    const quantity = p.quantity;
+    let shelf;
+    if (id >= 1 && id <= 4) shelf = 1;
+    else if (id >= 5 && id <= 8) shelf = 2;
+    else if (id >= 9 && id <= 16) shelf = 3;
+    else if (id >= 17 && id <= 24) shelf = 4;
+    else if (id >= 25 && id <= 32) shelf = 5;
+
+    if (shelf && !shelfStatus[shelf]) {
+      console.log(`❌ Shelf ${shelf} is disconnected for product ID ${id}`);
+      failedProducts.push({ id, quantity, failed: true });
+    } else if (shelf) {
+      shelves[shelf].push({ id, quantity, message: `${id},${quantity}` });
     }
-
-    if (!hasItems) {
-      console.error("❌ No valid items to process");
-      return reject(new Error("No valid items to process"));
-    }
-
-    currentResolve = resolve;
-    currentReject = reject;
-    processing = true;
-    processNextShelf();
   });
-}
 
-function processNextShelf() {
-  if (orderQueue.length === 0) {
-    console.log("✅ All shelves processed");
-    processing = false;
-    wsClients.forEach((client) =>
-      client.send(JSON.stringify({ type: "orderComplete", success: true }))
-    );
-    if (currentResolve) {
-      currentResolve({ success: true });
-      currentResolve = null;
-      currentReject = null;
+  let successfulProducts = [];
+  let shelfIndex = 5;
+
+  function processShelves() {
+    if (shelfIndex < 1) {
+      console.log("✅ All shelves processed");
+      return callback(null, { successfulProducts, failedProducts });
     }
-    return;
+
+    if (shelves[shelfIndex].length === 0) {
+      shelfIndex--;
+      return processShelves();
+    }
+
+    console.log(`📋 Processing shelf ${shelfIndex} with items:`, shelves[shelfIndex]);
+    let itemIndex = 0;
+
+    function processItem() {
+      if (itemIndex >= shelves[shelfIndex].length) {
+        shelfIndex--;
+        return processShelves();
+      }
+
+      const item = shelves[shelfIndex][itemIndex];
+      if (!client.connected || !shelfStatus[shelfIndex]) {
+        console.log(`❌ Shelf ${shelfIndex} disconnected for item: ${item.message}`);
+        failedProducts.push({ id: item.id, quantity: item.quantity, failed: true });
+        itemIndex++;
+        return processItem();
+      }
+
+      console.log(`📤 Publishing to vending/shelf/${shelfIndex}: ${item.message}`);
+      client.publish(`vending/shelf/${shelfIndex}`, item.message, { qos: 1 }, (err) => {
+        if (err) {
+          console.error(`❌ Failed to publish to vending/shelf/${shelfIndex}:`, err.message);
+          failedProducts.push({ id: item.id, quantity: item.quantity, failed: true });
+        } else {
+          console.log(`✅ Published to vending/shelf/${shelfIndex}: ${item.message}`);
+          successfulProducts.push({ id: item.id, quantity: item.quantity });
+        }
+        itemIndex++;
+        setTimeout(processItem, 1000);
+      });
+    }
+
+    processItem();
   }
 
-  const { shelf, items } = orderQueue.shift();
-  currentShelf = shelf;
-  currentItems = [...items];
-  console.log(`➡️ Starting shelf ${currentShelf} with items:`, items);
-
-  processNextItem();
-}
-
-function processNextItem() {
-  if (currentItems.length === 0) {
-    console.log(`✅ Finished shelf ${currentShelf}`);
-    processNextShelf();
-    return;
-  }
-
-  const item = currentItems[0];
-  const [id] = item.split(",");
-  console.log(`📤 Sending to shelf ${currentShelf}: ${item}`);
-
-  if (!shelfStatus[currentShelf]) {
-    console.log(`❌ Shelf ${currentShelf} disconnected`);
-    wsClients.forEach((client) =>
-      client.send(
-        JSON.stringify({
-          type: "orderStatus",
-          id: parseInt(id),
-          status: "Disconnected",
-        })
-      )
-    );
-    currentItems.shift();
-    processNextItem();
-    return;
-  }
-
-  client.publish(`vending/shelf/${currentShelf}`, item);
-  wsClients.forEach((client) =>
-    client.send(
-      JSON.stringify({
-        type: "orderStatus",
-        id: parseInt(id),
-        status: "Dispensing",
-      })
-    )
-  );
-
-  timeoutId = setTimeout(() => {
-    console.log(`❌ Timeout waiting for response from shelf ${currentShelf}`);
-    wsClients.forEach((client) =>
-      client.send(
-        JSON.stringify({
-          type: "orderStatus",
-          id: parseInt(id),
-          status: "Failed",
-        })
-      )
-    );
-    currentItems.shift();
-    processNextItem();
-  }, 15000);
+  processShelves();
 }
 
 function getEsp32Status() {
   return Object.values(shelfStatus).some((status) => status);
 }
 
-module.exports = {
-  sendOrderMQTT,
-  getEsp32Status,
-  setWsClients,
-};
+function getCardData() {
+  return cardData;
+}
+
+module.exports = { sendOrderMQTT, getEsp32Status, getCardData };
